@@ -310,6 +310,13 @@ func (bs *BoostSession) readSymTableStream(
 		if err != nil {
 			return nil, err
 		}
+
+		if instruction == core.NOPInstruction {
+			// We reached the end of the stream. This table is the being
+			// updated from the write side.
+			break
+		}
+
 		if v != version {
 			// This write must have failed in the middle. We need to search for
 			// the next InitSymTable instruction with the same version.
@@ -325,17 +332,18 @@ func (bs *BoostSession) readSymTableStream(
 			}
 			symTable := core.NewSymTable(streamId.String(), version, nil)
 			symTable.UpdateDictionary(instrParams)
-
 		}
+
+		if seqNum != prevSeqNum+1 {
+			// TODO, should we continue further to find another InitSymTable
+			// instruction with the same version?
+			return nil, errors.New("invalid sequence number")
+		}
+
 		if instruction == core.EndSymTable {
+			// Last instruction. Finalize the symtable and return
 			symTable.Finalize()
 			break
-		} else if instruction == core.NOPInstruction {
-			// We reached the end of the stream. This table is the being
-			// updated from the write side.
-			break
-		} else if seqNum != prevSeqNum+1 {
-			return nil, errors.New("invalid sequence number")
 		}
 
 		switch instruction {
