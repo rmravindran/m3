@@ -26,6 +26,7 @@ import (
 	"os"
 	"time"
 
+	boostclient "github.com/m3db/m3/src/boost/client"
 	"github.com/m3db/m3/src/dbnode/client"
 	"github.com/m3db/m3/src/dbnode/storage/index"
 	"github.com/m3db/m3/src/m3ninx/idx"
@@ -72,7 +73,108 @@ func main() {
 	}
 	defer session.Close()
 
-	runTaggedExample(session)
+	writeAttributeStream(session)
+	//runTaggedExample(session)
+}
+
+func writeAttributeStream(session client.Session) {
+
+	// First we create an instance of BoostSession which retains the fcuntion
+	// of a regular session but also has the ability to read and write
+	// attributes in a series.
+
+	boostSession := boostclient.NewBoostSession(session, 1000)
+
+	log.Printf("------ run tagged example ------")
+	var (
+		seriesID = ident.StringID("__name__=\"cpu_user_util\",region=\"us-east-1\",service=\"myservice1\"")
+		tags     = []ident.Tag{
+			{Name: ident.StringID("region"), Value: ident.StringID("us-east-1")},
+			{Name: ident.StringID("service"), Value: ident.StringID("myservice1")},
+		}
+		tagsIter = ident.NewTagsIterator(ident.NewTags(tags...))
+
+		attributes = []ident.Tag{
+			{Name: ident.StringID("host"), Value: ident.StringID("host-000001")},
+		}
+		attrIter = ident.NewTagsIterator(ident.NewTags(attributes...))
+	)
+
+	// Write a ts value with tags and attributes
+	timestamp := xtime.Now()
+	value := 42.0
+	err := boostSession.WriteValueWithTaggedAttributes(
+		namespaceID,
+		seriesID,
+		tagsIter,
+		attrIter,
+		timestamp,
+		value,
+		xtime.Millisecond)
+	if err != nil {
+		log.Fatalf("error writing series %s, err: %v", seriesID.String(), err)
+	}
+
+	end := xtime.Now()
+	start := end.Add(-time.Minute)
+
+	// Now lets read the series back out
+	seriesIter, err := boostSession.FetchValueWithTaggedAttribute(
+		namespaceID,
+		seriesID,
+		start,
+		end)
+	if err != nil {
+		log.Fatalf("error fetching data for untagged series: %v", err)
+	}
+	for seriesIter.Next() {
+		dp, _, _ := seriesIter.Current()
+		log.Printf("Series Value %s: %v", dp.TimestampNanos.String(), dp.Value)
+
+		// Lets also print out the tags and attributes
+		tags := seriesIter.Tags()
+		for tags.Next() {
+			tag := tags.Current()
+			log.Printf("Tag %s=%s", tag.Name.String(), tag.Value.String())
+		}
+
+		attributes := seriesIter.Attributes()
+		for attributes.Next() {
+			attribute := attributes.Current()
+			log.Printf("Attribute %s=%s", attribute.Name.String(), attribute.Value.String())
+		}
+	}
+	if err := seriesIter.Err(); err != nil {
+		log.Fatalf("error in series iterator: %v", err)
+	}
+
+	/*
+		// Now read the data back out using a different session
+		seriesIter, err = boostSession.FetchValueWithTaggedAttributes(
+			namespaceID,
+			seriesID,
+			start,
+			end)
+
+		// Test read the symtable
+		symTableName := "m3_symboltable_" + seriesID.String()
+		symTableSeriesId := ident.StringID(symTableName)
+
+		symTableReader := boostcore.NewM3DBSymStreamReader(
+			namespaceID,
+			symTableSeriesId,
+			session)
+		err = symTableReader.Seek(start, end)
+		if err != nil {
+			log.Fatalf("error seeking symtable: %v", err)
+		}
+
+		version, instruction, seqNum, err := symTableReader.Next()
+		if err != nil {
+			log.Fatalf("error reading symtable: %v", err)
+		}
+		log.Printf("SymTable Version: %d, Instruction: %d, SeqNum: %d", version, instruction, seqNum)
+	*/
 }
 
 // runTaggedExample demonstrates how to write "tagged" (indexed) metrics data

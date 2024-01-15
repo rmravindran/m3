@@ -10,22 +10,6 @@ import (
 	xtime "github.com/m3db/m3/src/x/time"
 )
 
-type TableInstruction int
-
-const (
-	// Initiatize the table
-	InitSymTable TableInstruction = iota
-
-	// Update the table
-	UpdateSymTable
-
-	// Add a new attribute to the table
-	AddAttribute
-
-	// End Dictionary
-	EndSymTable
-)
-
 type AttributeInstructionParams struct {
 	attributeName string
 	encodingType  core.AttributeEncoding
@@ -37,7 +21,7 @@ type DictionaryInstructionParams struct {
 }
 
 type Instruction struct {
-	instruction                TableInstruction
+	instruction                core.TableInstruction
 	attributeInstructionParam  *AttributeInstructionParams
 	dictionaryInstructionParam *DictionaryInstructionParams
 }
@@ -56,7 +40,7 @@ func (stb *SymTableBuilder) BuildSymTable(
 	namespaceId ident.ID,
 	name string,
 	tagsIt ident.TagIterator,
-	version uint64,
+	version uint16,
 	timeBegin xtime.UnixNano,
 	timeEnd xtime.UnixNano) (*core.SymTable, error) {
 
@@ -71,39 +55,68 @@ func (stb *SymTableBuilder) BuildSymTable(
 		if len(raw) < 16 {
 			return nil, errors.New("invalid symbol table data")
 		}
-		flags := binary.LittleEndian.Uint64(raw)
-		v := binary.LittleEndian.Uint64(raw[8:])
-		instruction := flags & 0xFFFFFFFF
-		if instruction != uint64(InitSymTable) || version != v {
+		ndx := 0
+		flags := binary.LittleEndian.Uint32(raw[ndx:])
+		ndx += 4
+		v := uint16(flags >> 16)    // Upper 16 bits
+		instruction := flags & 0xFF // Lower 8 bits
+		if instruction != uint32(core.InitSymTable) || version != v {
 			continue
 		}
 
 		// We found the Init entry matching the requested version. Build the
 		// symbol table until we find the END entry
-		symTable := core.NewSymTable(name)
+		symTable := core.NewSymTable(name, v, nil)
+
+		// Parse the parameters in the init
+		instrParams, err := stb.parseDictionaryInstructionParams(raw[ndx:])
+		if err != nil {
+			// Restart
+			symTable = nil
+			continue
+		}
+		err = symTable.UpdateDictionary(instrParams.dictValues)
+		if err != nil {
+			symTable = nil
+			continue
+		}
+
 		doRestart := false
 		for seriesIter.Next() {
 			_, _, raw := seriesIter.Current()
 			if len(raw) < 16 {
 				return nil, errors.New("invalid symbol table data")
 			}
-			flags := binary.LittleEndian.Uint64(raw)
-			v := binary.LittleEndian.Uint64(raw[8:])
-			instruction := flags & 0xFFFFFFFF
+
+			ndx := 0
+			flags := binary.LittleEndian.Uint32(raw[ndx:])
+			ndx += 4
+			v := uint16(flags >> 16)    // Upper 16 bits
+			instruction := flags & 0xFF // Lower 8 bits
+
 			switch instruction {
-			case uint64(InitSymTable):
+			case uint32(core.InitSymTable):
 				// The symtable we read was not complete. We need to restart
 				// the build of symtable from THIS point onwards. This usually
 				// happens if the symtable was not fully written to the stream
 				if v == version {
-					// Restart
-					symTable = core.NewSymTable(name)
+					symTable = core.NewSymTable(name, v, nil)
+					// Parse the parameters in the init
+					instrParams, err := stb.parseDictionaryInstructionParams(raw[ndx:])
+					if err != nil {
+						// Restart
+						doRestart = true
+					}
+					err = symTable.UpdateDictionary(instrParams.dictValues)
+					if err != nil {
+						doRestart = true
+					}
 					break
 				} else {
 					// Something really bad happened
 					return nil, errors.New("symbol table with version " + string(v) + " found when expecting version " + string(version))
 				}
-			case uint64(UpdateSymTable):
+			case uint32(core.UpdateSymTable):
 				instrParams, err := stb.parseDictionaryInstructionParams(raw[16:])
 				if err != nil {
 					// Restart
@@ -116,14 +129,14 @@ func (stb *SymTableBuilder) BuildSymTable(
 					indices[i] = uint64(baseIndex)
 					baseIndex++
 				}
-				err = symTable.UpdateDictionary(indices, instrParams.dictValues)
+				err = symTable.UpdateDictionary(instrParams.dictValues)
 				if err != nil {
 					// Restart
 					doRestart = true
 					break
 				}
 
-			case uint64(AddAttribute):
+			case uint32(core.AddAttribute):
 				instrParams, err := stb.parseAddAttributeInstructionParams(raw[16:])
 				if err != nil {
 					// Restart
@@ -137,7 +150,7 @@ func (stb *SymTableBuilder) BuildSymTable(
 					break
 				}
 
-			case uint64(EndSymTable):
+			case uint32(core.EndSymTable):
 				// Done
 				return symTable, nil
 			}

@@ -22,7 +22,19 @@ type AttributeTable struct {
 }
 
 type SymTable struct {
+
+	// Name of the symbol table. Usually the seriesId with a prefix
+	// such as "m3_symboltable_"
 	name string
+
+	// Current version of the symbol table
+	version uint16
+
+	// Instruction sequence number reprensents a unique state identifier
+	instructionSeqNum uint32
+
+	// Is the table finalized. Once finalized, no more updates can be made
+	finalized bool
 
 	// Dictionary encoded entries of the attributes
 	dictToString map[uint64]string
@@ -33,15 +45,22 @@ type SymTable struct {
 
 	// Attribute Tables
 	attributeTable map[string]*AttributeTable
+
+	// Stream writer
+	streamWriter SymStreamWriter
 }
 
-func NewSymTable(name string) *SymTable {
+func NewSymTable(name string, version uint16, streamWriter SymStreamWriter) *SymTable {
 	return &SymTable{
-		name:           name,
-		dictToString:   make(map[uint64]string),
-		dictToIndex:    make(map[string]uint64),
-		header:         make(map[string]int),
-		attributeTable: make(map[string]*AttributeTable),
+		name:              name,
+		version:           version,
+		instructionSeqNum: 0,
+		finalized:         false,
+		dictToString:      make(map[uint64]string),
+		dictToIndex:       make(map[string]uint64),
+		header:            make(map[string]int),
+		attributeTable:    make(map[string]*AttributeTable),
+		streamWriter:      streamWriter,
 	}
 }
 
@@ -50,23 +69,35 @@ func (sym *SymTable) Name() string {
 	return sym.name
 }
 
+// Return the version of the symbol table
+func (sym *SymTable) Version() uint16 {
+	return sym.version
+}
+
 // Returns the number of symbols in the symbol table
 func (sym *SymTable) NumSymbols() int {
 	return len(sym.dictToString)
 }
 
-// Update the dictionary with the given indices and attribute values. If the
-// index already exists in the dictionary, or the attribute name already exists
-// in the dictionary, this is an error
-func (sym *SymTable) UpdateDictionary(indices []uint64, attributeValues []string) error {
-	if len(indices) == 0 || len(indices) != len(attributeValues) {
-		return errors.New("indices and values must of the same size")
+// Returns the number of attributes in the symbol table
+func (sym *SymTable) NumAttributes() int {
+	return len(sym.attributeTable)
+}
+
+// Update the dictionary with the given attribute values. If the attribute
+// values already exists in the dictionary, this is an error
+func (sym *SymTable) UpdateDictionary(attributeValues []string) error {
+	if len(attributeValues) == 0 {
+		return errors.New("attribute values are empty")
 	}
 
-	for i, indexValue := range indices {
-		attributeValue := attributeValues[i]
+	indexValue := uint64(len(sym.dictToString))
+	for _, attributeValue := range attributeValues {
 
 		if _, ok := sym.dictToString[indexValue]; ok {
+			// This should, in theory never happen. The only this could happend
+			// is someone modified the dicToString or dictToIndex through
+			// another means
 			return errors.New("index value already exists in symbol table")
 		}
 
@@ -76,6 +107,27 @@ func (sym *SymTable) UpdateDictionary(indices []uint64, attributeValues []string
 
 		sym.dictToString[indexValue] = attributeValue
 		sym.dictToIndex[attributeValue] = indexValue
+		indexValue++
+	}
+
+	// Update the stream if the table is not finalized and we have a stream
+	// writer attached to this symtable
+	if !sym.finalized && sym.streamWriter != nil {
+		var err error = nil
+		if sym.instructionSeqNum == 0 {
+			err = sym.streamWriter.WriteInitInstruction(sym.version, attributeValues)
+		} else {
+			err = sym.streamWriter.WriteUpdateInstruction(
+				sym.version,
+				sym.instructionSeqNum+1,
+				attributeValues)
+		}
+		if err != nil {
+			return err
+		}
+
+		// Update the sequence number
+		sym.instructionSeqNum++
 	}
 
 	return nil
@@ -115,6 +167,31 @@ func (sym *SymTable) InsertAttributeValue(name string, value string) error {
 		sym.attributeTable[name].encodedValuesFromIndex[id] = uint64(len(sym.attributeTable[name].encodedValuesFromIndex))
 	}
 
+	// Update the stream
+	return sym.updateStreamWithAttributeInstructionParam(name, []uint64{id})
+}
+
+// Update the stream if the table is not finalized and we have a stream
+// writer attached to this symtable
+func (sym *SymTable) updateStreamWithAttributeInstructionParam(
+	name string,
+	indices []uint64) error {
+
+	if sym.streamWriter != nil && !sym.finalized {
+		err := sym.streamWriter.WriteAttributeInstruction(
+			sym.version,
+			sym.instructionSeqNum+1,
+			name,
+			DictionaryEncodedValue,
+			indices)
+		if err != nil {
+			return err
+		}
+
+		// Update the sequence number
+		sym.instructionSeqNum++
+	}
+
 	return nil
 }
 
@@ -146,11 +223,11 @@ func (sym *SymTable) InsertAttributeIndices(name string, indices []uint64) error
 		sym.attributeTable[name].encodedValuesFromIndex[index] = uint64(len(sym.attributeTable[name].encodedValuesFromIndex))
 	}
 
-	return nil
+	return sym.updateStreamWithAttributeInstructionParam(name, indices)
 }
 
-// Find the index of the given attribute value. If the attribute value doesn't
-// exist, returns -1
+// Find the index of the given attribute value. If the attribute having the
+// specified name or the given value doesn't exist, return -1
 func (sym *SymTable) FindAttributeIndex(name string, value string) int {
 	if _, ok := sym.attributeTable[name]; !ok {
 		return -1
@@ -168,8 +245,8 @@ func (sym *SymTable) FindAttributeIndex(name string, value string) int {
 	return -1
 }
 
-// Find the attribute value for the given index. If the index doesn't exist,
-// returns an empty string
+// Find the attribute value for the given index. If the attribute having the
+// specified name doesn't exist or the index is out of bounds, return an empty
 func (sym *SymTable) FindAttributeValue(name string, index uint64) string {
 	if _, ok := sym.attributeTable[name]; !ok {
 		return ""
@@ -188,17 +265,90 @@ func (sym *SymTable) FindAttributeValue(name string, index uint64) string {
 	return value
 }
 
-// Return the index header for the given set of attributes
-func (sym *SymTable) GetIndexedHeader(attributes map[string]string) []int {
+// Return the index header for the given set of attributes. If input refers
+// to an attribute that does exist or a value that is not in the symbol table,
+// the corresponding index is set to -1 and will return false
+func (sym *SymTable) GetIndexedHeader(attributes map[string]string) ([]int, bool) {
 	header := make([]int, len(sym.header))
 
+	if len(sym.header) == 0 {
+		return header, true
+	}
+
+	hasMissing := false
 	for name, i := range sym.header {
 		header[i] = -1
 		val, ok := attributes[name]
 		if ok {
 			header[i] = sym.FindAttributeIndex(name, val)
+			if header[i] == -1 {
+				hasMissing = true
+			}
+		} else {
+			hasMissing = true
 		}
 	}
 
-	return header
+	return header, hasMissing
+}
+
+// Return the attribute name and value map for the given indexed header
+func (sym *SymTable) GetAttributesFromIndexedHeader(header []int) map[string]string {
+	attributes := make(map[string]string)
+	for name, i := range sym.header {
+		if i < len(header) {
+			if header[i] != -1 {
+				attributes[name] = sym.FindAttributeValue(name, uint64(header[i]))
+			}
+		}
+	}
+	return attributes
+}
+
+// Finalize the symbol table. Once finalized, no more updates can be made
+func (sym *SymTable) Finalize() {
+	sym.finalized = true
+	// TODO: Write the End instruction to the stream
+}
+
+// Return true if the specified other symbol table is the same as this one
+// Two symbol tables are the same if they encode the same symbols and attribute
+// values
+func (sym *SymTable) IsSame(other *SymTable) bool {
+	if len(sym.dictToString) != len(other.dictToString) {
+		return false
+	}
+
+	for k, v := range sym.dictToString {
+		if other.dictToString[k] != v {
+			return false
+		}
+	}
+
+	if len(sym.attributeTable) != len(other.attributeTable) {
+		return false
+	}
+
+	for k, v := range sym.attributeTable {
+		otherV, ok := other.attributeTable[k]
+		if !ok {
+			return false
+		}
+
+		if v.encodingType != otherV.encodingType {
+			return false
+		}
+
+		if len(v.encodedValues) != len(otherV.encodedValues) {
+			return false
+		}
+
+		for i, val := range v.encodedValues {
+			if val != otherV.encodedValues[i] {
+				return false
+			}
+		}
+	}
+
+	return true
 }
