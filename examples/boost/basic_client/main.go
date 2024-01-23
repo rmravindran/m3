@@ -117,7 +117,7 @@ func main() {
 	//readTaggedValueWithAttribute(session, seriesID, start, end)
 
 	// Test writing a large number of attributes
-	writeAndReadLargeData(session, 100)
+	writeAndReadLargeData(session, 10000)
 	//time.Sleep(250 * time.Millisecond)
 	//writeAndReadLargeDataWithoutAttributes(session, 10000)
 }

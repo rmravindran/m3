@@ -25,8 +25,6 @@ type BoostSession struct {
 	rwControl           sync.Mutex
 }
 
-type CompletionFn func(err error)
-
 // NewBoostSession returns a new session that can be used to write to the database.
 func NewBoostSession(
 	session client.Session,
@@ -91,7 +89,7 @@ func (bs *BoostSession) WriteValueWithTaggedAttributes(
 	t xtime.UnixNano,
 	value float64,
 	unit xtime.Unit,
-	completionFn CompletionFn,
+	completionFn core.TAPWriteCompletionFn,
 ) error {
 
 	// Check if the symbol table exists for this data series. This is done
@@ -144,7 +142,7 @@ func (bs *BoostSession) WriteValueWithTaggedAttributes(
 		t xtime.UnixNano,
 		value float64,
 		unit xtime.Unit,
-		completionFn CompletionFn) {
+		completionFn core.TAPWriteCompletionFn) {
 		ret := bs.session.WriteTagged(namespace, id, tags, t, value, unit, annotation)
 		completionFn(ret)
 	}(namespace, id, tags.Duplicate(), t, value, unit, completionFn)
