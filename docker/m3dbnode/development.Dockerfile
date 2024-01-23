@@ -12,7 +12,7 @@ RUN apk add --no-cache tzdata curl jq
 ADD ./m3dbnode /bin/m3dbnode
 ADD ./config/m3dbnode-local-etcd.yml /etc/m3dbnode/m3dbnode.yml
 
-EXPOSE 2379/tcp 2380/tcp 7201/tcp 7203/tcp 9000-9004/tcp
+EXPOSE 2379-2380/tcp 7201-7203/tcp 9000-9005/tcp
 
 ENV GODEBUG madvdontneed=1
 
