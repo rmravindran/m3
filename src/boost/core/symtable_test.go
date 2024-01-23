@@ -8,13 +8,12 @@ import (
 
 func TestSymTableUpdateDictionary(t *testing.T) {
 
-	symTable := NewSymTable("test")
+	symTable := NewSymTable("test", 1, nil)
 	require.NotNil(t, symTable)
 
-	indices := []uint64{1, 2, 3, 4, 5}
 	attributeValues := []string{"a", "b", "c", "d", "e"}
 
-	err := symTable.UpdateDictionary(indices, attributeValues)
+	err := symTable.UpdateDictionary(attributeValues)
 	require.NoError(t, err)
 
 	// Test that the dictionary is updated correctly
@@ -28,19 +27,16 @@ func TestSymTableUpdateDictionary(t *testing.T) {
 	require.False(t, symTable.AttributeValueExists("f"))
 
 	// Adding something that already exists should fail
-	err = symTable.UpdateDictionary([]uint64{6}, []string{"a"})
-	require.Error(t, err)
-	err = symTable.UpdateDictionary([]uint64{5}, []string{"x"})
+	err = symTable.UpdateDictionary([]string{"a"})
 	require.Error(t, err)
 }
 
 func TestSymTableAttributes(t *testing.T) {
-	symTable := NewSymTable("test")
+	symTable := NewSymTable("test", 1, nil)
 	require.NotNil(t, symTable)
 
-	indices := []uint64{0, 1, 2, 3, 4}
 	attributeValues := []string{"a", "b", "c", "d", "e"}
-	err := symTable.UpdateDictionary(indices, attributeValues)
+	err := symTable.UpdateDictionary(attributeValues)
 	require.NoError(t, err)
 
 	// Create an attribute
@@ -65,29 +61,31 @@ func TestSymTableAttributes(t *testing.T) {
 
 	// Get the indexed header. It should have just 1 entry since we only
 	// have 1 attribute
-	indexedHeader := symTable.GetIndexedHeader(map[string]string{"host": "a"})
+	indexedHeader, hasMissing := symTable.GetIndexedHeader(map[string]string{"host": "a"})
 	require.Equal(t, 1, len(indexedHeader))
 	require.Equal(t, 0, indexedHeader[0])
+	require.False(t, hasMissing)
 	// Asking for a non-existent attribute should return a header with -1
-	indexedHeader = symTable.GetIndexedHeader(map[string]string{"crap": "a"})
+	indexedHeader, hasMissing = symTable.GetIndexedHeader(map[string]string{"crap": "a"})
 	require.Equal(t, 1, len(indexedHeader))
 	require.Equal(t, -1, indexedHeader[0])
+	require.True(t, hasMissing)
 	// Asking for a non-existent value should return a header with -1
-	indexedHeader = symTable.GetIndexedHeader(map[string]string{"host": "crap"})
+	indexedHeader, hasMissing = symTable.GetIndexedHeader(map[string]string{"host": "crap"})
 	require.Equal(t, 1, len(indexedHeader))
 	require.Equal(t, -1, indexedHeader[0])
+	require.True(t, hasMissing)
 }
 
 func TestSymTableMultipleAttributesSharingIndex(t *testing.T) {
-	symTable := NewSymTable("test")
+	symTable := NewSymTable("test", 1, nil)
 	require.NotNil(t, symTable)
 
 	// host, src, dst all share the same universe of values
 
-	indices := []uint64{0, 1, 2, 3, 4, 5, 7, 8, 9, 10}
 	attributeValues := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
 
-	err := symTable.UpdateDictionary(indices, attributeValues)
+	err := symTable.UpdateDictionary(attributeValues)
 	require.NoError(t, err)
 
 	// Add all attribute values as host attribute values
@@ -125,7 +123,7 @@ func TestSymTableMultipleAttributesSharingIndex(t *testing.T) {
 	// Check the indexed data, it should have 3 entries all 0 since we are
 	// asking for the first value encoded in the insert operation for each
 	// attribute
-	indexedHeader := symTable.GetIndexedHeader(
+	indexedHeader, hasMissing := symTable.GetIndexedHeader(
 		map[string]string{
 			"host": "a",
 			"src":  "a",
@@ -135,4 +133,63 @@ func TestSymTableMultipleAttributesSharingIndex(t *testing.T) {
 	require.Equal(t, 0, indexedHeader[0])
 	require.Equal(t, 0, indexedHeader[0])
 	require.Equal(t, 0, indexedHeader[0])
+	require.False(t, hasMissing)
+}
+
+func TestSymTableSame(t *testing.T) {
+	symTable := NewSymTable("test", 1, nil)
+	otherTable := NewSymTable("test2", 2, nil)
+	require.NotNil(t, symTable)
+	require.NotNil(t, otherTable)
+
+	// host, src, dst all share the same universe of values
+
+	attributeValues := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
+
+	err := symTable.UpdateDictionary(attributeValues)
+	require.NoError(t, err)
+	err = otherTable.UpdateDictionary(attributeValues)
+	require.NoError(t, err)
+
+	// Add all attribute values as host attribute values
+	for _, v := range attributeValues {
+		symTable.InsertAttributeValue("host", v)
+		otherTable.InsertAttributeValue("host", v)
+	}
+	require.True(t, symTable.IsSame(otherTable))
+
+	// Missing dictionary entry is not the same
+	symTable.InsertAttributeValue("host", "crap")
+	require.False(t, symTable.IsSame(otherTable))
+
+	// Now it should be same
+	otherTable.InsertAttributeValue("host", "crap")
+	require.True(t, symTable.IsSame(otherTable))
+
+	// Add some of the attribute values as src attribute values
+	for _, v := range attributeValues[0:5] {
+		symTable.InsertAttributeValue("src", v)
+	}
+
+	// Attribute doesn't exist int the other table
+	require.False(t, symTable.IsSame(otherTable))
+
+	// Attribute exists but doesn't all the values
+	for _, v := range attributeValues[0:4] {
+		otherTable.InsertAttributeValue("src", v)
+	}
+	require.False(t, symTable.IsSame(otherTable))
+
+	// Now all values exists
+	otherTable.InsertAttributeValue("src", attributeValues[4])
+	require.True(t, symTable.IsSame(otherTable))
+
+	// Attribute exist but not applied in the same order. This implies
+	// that the two streams that built up the the symtable was not streamed
+	// in the same order
+	symTable.InsertAttributeValue("dst", attributeValues[0])
+	symTable.InsertAttributeValue("dst", attributeValues[1])
+	otherTable.InsertAttributeValue("dst", attributeValues[1])
+	otherTable.InsertAttributeValue("dst", attributeValues[0])
+	require.False(t, symTable.IsSame(otherTable))
 }

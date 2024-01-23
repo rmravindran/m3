@@ -257,6 +257,9 @@ func (q *queue) drain() {
 
 	for ops := range q.drainIn {
 		opsLen := len(ops)
+		//if opsLen > 1 {
+		//	fmt.Printf("drain: %d ops\n", opsLen)
+		//}
 		for i := 0; i < opsLen; i++ {
 			switch v := ops[i].(type) {
 			case *writeOperation:
