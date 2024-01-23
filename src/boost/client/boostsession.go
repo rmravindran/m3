@@ -4,6 +4,7 @@ import (
 	gocontext "context"
 	"encoding/binary"
 	"errors"
+	"sync"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/m3db/m3/src/boost/core"
@@ -21,7 +22,10 @@ type BoostSession struct {
 	symTables           *lru.Cache[string, *core.SymTable]
 	numSymbolUpdates    uint64
 	numAttributeUpdates uint64
+	rwControl           sync.Mutex
 }
+
+type CompletionFn func(err error)
 
 // NewBoostSession returns a new session that can be used to write to the database.
 func NewBoostSession(
@@ -32,6 +36,7 @@ func NewBoostSession(
 		maxSymTables:        maxSymTables,
 		numSymbolUpdates:    0,
 		numAttributeUpdates: 0,
+		rwControl:           sync.Mutex{},
 	}
 
 	cache, err := lru.New[string, *core.SymTable](maxSymTables)
@@ -86,7 +91,13 @@ func (bs *BoostSession) WriteValueWithTaggedAttributes(
 	t xtime.UnixNano,
 	value float64,
 	unit xtime.Unit,
+	completionFn CompletionFn,
 ) error {
+
+	// Check if the symbol table exists for this data series. This is done
+	// under a lock
+	bs.rwControl.Lock()
+
 	dataSeriesId := id.String()
 	symTableName := "m3_symboltable_" + dataSeriesId
 	symTable, ok := bs.symTables.Get(symTableName)
@@ -111,6 +122,7 @@ func (bs *BoostSession) WriteValueWithTaggedAttributes(
 		bs.updateSymbolsAndAttributes(symTable, attrMap)
 		indexedHeader, hasMissing = symTable.GetIndexedHeader(attrMap)
 		if hasMissing {
+			bs.rwControl.Unlock()
 			return errors.New("unable to find all attributes in the symbol table")
 		}
 	}
@@ -122,8 +134,22 @@ func (bs *BoostSession) WriteValueWithTaggedAttributes(
 	for i, index := range indexedHeader {
 		binary.LittleEndian.PutUint32(tmp[i*4:], uint32(index))
 	}
+	// Unlock the mutex
+	bs.rwControl.Unlock()
 
-	return bs.session.WriteTagged(namespace, id, tags, t, value, unit, annotation)
+	go func(
+		namespace,
+		id ident.ID,
+		tags ident.TagIterator,
+		t xtime.UnixNano,
+		value float64,
+		unit xtime.Unit,
+		completionFn CompletionFn) {
+		ret := bs.session.WriteTagged(namespace, id, tags, t, value, unit, annotation)
+		completionFn(ret)
+	}(namespace, id, tags.Duplicate(), t, value, unit, completionFn)
+
+	return nil
 }
 
 // Fetch values from the database for an ID.
@@ -153,6 +179,11 @@ func (bs *BoostSession) fetchOrCreateSymTable(
 	timeEnd xtime.UnixNano) (*core.SymTable, error) {
 
 	// Find the version encoded in the annotation
+
+	// Check if the symbol table exists for this data series. This is done
+	// under a lock
+	bs.rwControl.Lock()
+	defer bs.rwControl.Unlock()
 
 	symTable, ok := bs.symTables.Get(symTableName)
 	if !ok {

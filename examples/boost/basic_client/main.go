@@ -24,6 +24,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime"
+	"runtime/pprof"
+	"sync/atomic"
 	"time"
 
 	boostclient "github.com/m3db/m3/src/boost/client"
@@ -32,6 +35,8 @@ import (
 	xtime "github.com/m3db/m3/src/x/time"
 
 	yaml "gopkg.in/yaml.v2"
+
+	"github.com/montanaflynn/stats"
 )
 
 const (
@@ -65,22 +70,44 @@ func main() {
 		log.Fatalf("unable to create new M3DB client: %v", err)
 	}
 
-	opt := client.Options()
-	opt.SetWriteBatchSize(1000)
-	opt.SetHostQueueOpsFlushSize(1000)
-	opt.SetHostQueueOpsFlushInterval(time.Millisecond * 1)
+	fmt.Printf("gomaxprocs %d\n", runtime.GOMAXPROCS(0))
 
+	opt := client.Options()
+
+	opt = opt.SetWriteBatchSize(16).
+		SetHostQueueOpsFlushSize(16).
+		SetAsyncWriteMaxConcurrency(8096).
+		//SetWriteOpPoolSize(8096).
+		SetHostQueueOpsArrayPoolSize(128).
+		//SetUseV2BatchAPIs(true).
+		SetHostQueueOpsFlushInterval(100 * time.Microsecond)
+	chOpt := opt.ChannelOptions()
+	chOpt.DefaultConnectionOptions.SendBufferSize = 8 * 1024 * 1024
+	chOpt.DefaultConnectionOptions.RecvBufferSize = 8 * 1024 * 1024
+
+	log.Printf("AsyncWriteMaxCuncurrency: %d", client.Options().AsyncWriteMaxConcurrency())
+	log.Printf("WriteOpPoolSize: %d", client.Options().WriteOpPoolSize())
+	log.Printf("HostQueueOpsArrayPoolSize: %d", client.Options().HostQueueOpsArrayPoolSize())
 	log.Printf("WriteBatchSize: %d", client.Options().WriteBatchSize())
 	log.Printf("HostQueueOpsFlushSize: %d", client.Options().HostQueueOpsFlushSize())
 	log.Printf("HostQueueOpsFlushInterval: %s", client.Options().HostQueueOpsFlushInterval().String())
 
-	session, err := client.NewSession()
+	session, err := client.NewSessionWithOptions(opt)
 	if err != nil {
 		log.Fatalf("unable to create new M3DB session: %v", err)
 	}
+
 	defer session.Close()
 
 	log.Printf("------ run tagged attribute example ------")
+
+	f, err := os.Create("cpu_profile.prof")
+	if err != nil {
+		log.Fatal(err)
+	}
+	pprof.StartCPUProfile(f)
+	runtime.SetCPUProfileRate(100)
+	defer pprof.StopCPUProfile()
 
 	// First write and read a tagged value with attribute.
 	//seriesID, start, end := writeAndReadTaggedValueWithAttribute(session)
@@ -90,9 +117,15 @@ func main() {
 	//readTaggedValueWithAttribute(session, seriesID, start, end)
 
 	// Test writing a large number of attributes
-	//writeAndReadLargeData(session, 100)
+	writeAndReadLargeData(session, 100)
 	//time.Sleep(250 * time.Millisecond)
-	writeAndReadLargeDataWithoutAttributes(session, 100)
+	//writeAndReadLargeDataWithoutAttributes(session, 10000)
+}
+
+var numWrites atomic.Uint64
+
+func completionFn(err error) {
+	numWrites.Add(1)
 }
 
 func writeAndReadTaggedValueWithAttribute(session client.Session) (ident.ID, xtime.UnixNano, xtime.UnixNano) {
@@ -130,7 +163,8 @@ func writeAndReadTaggedValueWithAttribute(session client.Session) (ident.ID, xti
 		attrIter,
 		timestamp,
 		value,
-		xtime.Millisecond)
+		xtime.Millisecond,
+		completionFn)
 	if err != nil {
 		log.Fatalf("error writing series %s, err: %v", seriesID.String(), err)
 	}
@@ -244,8 +278,12 @@ func writeAndReadLargeDataWithoutAttributes(session client.Session, count int) {
 		log.Printf("------ write large data (no attributes) to db ------")
 		writtenValue := 1.0
 		// Same series, but with 1000000 attributes
+		tookTimes := make([]int, count)
 		for i := 0; i < count; i++ {
-
+			//seriesName := "__name__=\"cpu_user_util\",region=\"us-east-1\",service=\"myservice1\""
+			//hostName := seriesName + fmt.Sprintf("host-%07d", i%10)
+			//seriesID = ident.StringID(hostName)
+			clockStart := xtime.Now()
 			// Write a ts value with tags and attributes
 			timestamp := xtime.Now()
 			err := session.WriteTagged(
@@ -260,7 +298,16 @@ func writeAndReadLargeDataWithoutAttributes(session client.Session, count int) {
 				log.Fatalf("error writing series %s, err: %v", seriesID.String(), err)
 			}
 			writtenValue++
+			clockStop := xtime.Now()
+			dur := clockStop - clockStart
+			tookTimes[i] = dur.ToTime().Nanosecond() / 1000
 		}
+		d := stats.LoadRawData(tookTimes)
+		//a, _ := stats.Min(d)
+		//fmt.Println("min time:", a)
+		pcts := []float64{50, 90, 99, 99.9}
+		desc, _ := stats.Describe(d, false, &pcts)
+		fmt.Println(desc.String(2))
 	}()
 	end := xtime.Now()
 	return
@@ -316,12 +363,16 @@ func writeAndReadLargeData(session client.Session, count int) {
 	)
 
 	// Write with fresh dictionary
+	numWrites = atomic.Uint64{}
+	numWrites.Store(0)
 	writeDataWithAttributes(boostSession, seriesID, tagsIter, count)
 	time.Sleep(250 * time.Millisecond)
 
 	// Write with reuse of the dictionary
 	log.Printf("Write with reuse of the dictionary")
+	numWrites.Store(0)
 	start, end := writeDataWithAttributes(boostSession, seriesID, tagsIter, count)
+	time.Sleep(5000 * time.Millisecond)
 
 	readDataWithAttribute(boostSession, seriesID, start, end)
 }
@@ -334,6 +385,7 @@ func writeDataWithAttributes(boostSession *boostclient.BoostSession,
 	log.Printf("------ write large data (with attributes) to db ------")
 	start := xtime.Now()
 	writtenValue := 1.0
+
 	// Same series, but with 1000000 attributes
 	for i := 0; i < count; i++ {
 		hostName := fmt.Sprintf("host-%07d", i)
@@ -351,13 +403,22 @@ func writeDataWithAttributes(boostSession *boostclient.BoostSession,
 			attrIter,
 			timestamp,
 			writtenValue,
-			xtime.Nanosecond)
+			xtime.Nanosecond,
+			completionFn)
 		if err != nil {
 			log.Fatalf("error writing series %s, err: %v", seriesID.String(), err)
 		}
 		writtenValue++
 	}
 	end := xtime.Now()
+
+	// Wait until numWrites reaches count
+	for {
+		if numWrites.Load() == uint64(count) {
+			break
+		}
+		time.Sleep(1 * time.Millisecond)
+	}
 
 	return start, end
 }
