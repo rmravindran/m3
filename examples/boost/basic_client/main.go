@@ -26,7 +26,6 @@ import (
 	"os"
 	"runtime"
 	"runtime/pprof"
-	"sync/atomic"
 	"time"
 
 	boostclient "github.com/m3db/m3/src/boost/client"
@@ -35,8 +34,6 @@ import (
 	xtime "github.com/m3db/m3/src/x/time"
 
 	yaml "gopkg.in/yaml.v2"
-
-	"github.com/montanaflynn/stats"
 )
 
 const (
@@ -74,23 +71,25 @@ func main() {
 
 	opt := client.Options()
 
-	opt = opt.SetWriteBatchSize(16).
-		SetHostQueueOpsFlushSize(16).
+	opt = opt.SetWriteBatchSize(256).
+		SetHostQueueOpsFlushSize(256).
 		SetAsyncWriteMaxConcurrency(8096).
 		//SetWriteOpPoolSize(8096).
 		SetHostQueueOpsArrayPoolSize(128).
 		//SetUseV2BatchAPIs(true).
 		SetHostQueueOpsFlushInterval(100 * time.Microsecond)
 	chOpt := opt.ChannelOptions()
-	chOpt.DefaultConnectionOptions.SendBufferSize = 8 * 1024 * 1024
-	chOpt.DefaultConnectionOptions.RecvBufferSize = 8 * 1024 * 1024
+	chOpt.DefaultConnectionOptions.SendBufferSize = 4 * 1024 * 1024
+	chOpt.DefaultConnectionOptions.RecvBufferSize = 4 * 1024 * 1024
 
-	log.Printf("AsyncWriteMaxCuncurrency: %d", client.Options().AsyncWriteMaxConcurrency())
-	log.Printf("WriteOpPoolSize: %d", client.Options().WriteOpPoolSize())
-	log.Printf("HostQueueOpsArrayPoolSize: %d", client.Options().HostQueueOpsArrayPoolSize())
-	log.Printf("WriteBatchSize: %d", client.Options().WriteBatchSize())
-	log.Printf("HostQueueOpsFlushSize: %d", client.Options().HostQueueOpsFlushSize())
-	log.Printf("HostQueueOpsFlushInterval: %s", client.Options().HostQueueOpsFlushInterval().String())
+	log.Printf("AsyncWriteMaxCuncurrency: %d", opt.AsyncWriteMaxConcurrency())
+	log.Printf("WriteOpPoolSize: %d", opt.WriteOpPoolSize())
+	log.Printf("HostQueueOpsArrayPoolSize: %d", opt.HostQueueOpsArrayPoolSize())
+	log.Printf("WriteBatchSize: %d", opt.WriteBatchSize())
+	log.Printf("HostQueueOpsFlushSize: %d", opt.HostQueueOpsFlushSize())
+	log.Printf("HostQueueOpsFlushInterval: %s", opt.HostQueueOpsFlushInterval().String())
+	log.Printf("SendBufferSize: %d", opt.ChannelOptions().DefaultConnectionOptions.SendBufferSize)
+	log.Printf("RecvBufferSize: %d", opt.ChannelOptions().DefaultConnectionOptions.RecvBufferSize)
 
 	session, err := client.NewSessionWithOptions(opt)
 	if err != nil {
@@ -109,249 +108,29 @@ func main() {
 	runtime.SetCPUProfileRate(100)
 	defer pprof.StopCPUProfile()
 
-	// First write and read a tagged value with attribute.
-	//seriesID, start, end := writeAndReadTaggedValueWithAttribute(session)
-
-	// Now read the data using a different session (forcing the symbol table
-	// to be fetched from the database)
-	//readTaggedValueWithAttribute(session, seriesID, start, end)
-
-	// Test writing a large number of attributes
-	writeAndReadLargeData(session, 10000)
-	//time.Sleep(250 * time.Millisecond)
-	//writeAndReadLargeDataWithoutAttributes(session, 10000)
+	// Write and read large table data
+	writeAndReadLargeTableData(session, 100000)
 }
 
-var numWrites atomic.Uint64
-
-func completionFn(err error) {
-	numWrites.Add(1)
-}
-
-func writeAndReadTaggedValueWithAttribute(session client.Session) (ident.ID, xtime.UnixNano, xtime.UnixNano) {
-
-	// First we create an instance of BoostSession which retains the fcuntion
-	// of a regular session but also has the ability to read and write
-	// attributes in a series.
-
-	boostSession := boostclient.NewBoostSession(session, 1000)
-
-	start := xtime.Now()
-
-	log.Printf("------ write to db ------")
-	var (
-		seriesID = ident.StringID("__name__=\"cpu_user_util\",region=\"us-east-1\",service=\"myservice1\"")
-		tags     = []ident.Tag{
-			{Name: ident.StringID("region"), Value: ident.StringID("us-east-1")},
-			{Name: ident.StringID("service"), Value: ident.StringID("myservice1")},
-		}
-		tagsIter = ident.NewTagsIterator(ident.NewTags(tags...))
-
-		attributes = []ident.Tag{
-			{Name: ident.StringID("host"), Value: ident.StringID("host-000001")},
-		}
-		attrIter = ident.NewTagsIterator(ident.NewTags(attributes...))
-	)
-
-	// Write a ts value with tags and attributes
-	timestamp := xtime.Now()
-	value := 42.0
-	err := boostSession.WriteValueWithTaggedAttributes(
-		namespaceID,
-		seriesID,
-		tagsIter,
-		attrIter,
-		timestamp,
-		value,
-		xtime.Millisecond,
-		completionFn)
-	if err != nil {
-		log.Fatalf("error writing series %s, err: %v", seriesID.String(), err)
-	}
-
-	end := xtime.Now()
-	start = start.Add(-time.Millisecond * 5)
-
-	log.Printf("------ read from db ------")
-
-	// Now lets read the series back out
-	seriesIter, err := boostSession.FetchValueWithTaggedAttribute(
-		namespaceID,
-		seriesID,
-		start,
-		end)
-	if err != nil {
-		log.Fatalf("error fetching data for untagged series: %v", err)
-	}
-	for seriesIter.Next() {
-		dp, _, _ := seriesIter.Current()
-		log.Printf("Series Value %s: %v", dp.TimestampNanos.String(), dp.Value)
-
-		// Lets also print out the tags and attributes
-		tags := seriesIter.Tags()
-		for tags.Next() {
-			tag := tags.Current()
-			log.Printf("Tag %s=%s", tag.Name.String(), tag.Value.String())
-		}
-
-		attributes := seriesIter.Attributes()
-		for attributes.Next() {
-			attribute := attributes.Current()
-			log.Printf("Attribute %s=%s", attribute.Name.String(), attribute.Value.String())
-		}
-	}
-	if err := seriesIter.Err(); err != nil {
-		log.Fatalf("error in series iterator: %v", err)
-	}
-
-	return seriesID, start, end
-}
-
-func readTaggedValueWithAttribute(
-	session client.Session,
-	seriesID ident.ID,
-	start xtime.UnixNano,
-	end xtime.UnixNano) {
-
-	// First we create an instance of BoostSession which retains the function
-	// of a regular session but also has the ability to read and write
-	// attributes in a series.
-
-	boostSession := boostclient.NewBoostSession(session, 1000)
-
-	log.Printf("------ read with new session instance ------")
-
-	// Now lets read the series back out
-	seriesIter, err := boostSession.FetchValueWithTaggedAttribute(
-		namespaceID,
-		seriesID,
-		start,
-		end)
-	if err != nil {
-		log.Fatalf("error fetching data for untagged series: %v", err)
-	}
-	for seriesIter.Next() {
-		dp, _, _ := seriesIter.Current()
-		log.Printf("Series Value %s: %v", dp.TimestampNanos.String(), dp.Value)
-
-		// Lets also print out the tags and attributes
-		tags := seriesIter.Tags()
-		for tags.Next() {
-			tag := tags.Current()
-			log.Printf("Tag %s=%s", tag.Name.String(), tag.Value.String())
-		}
-
-		attributes := seriesIter.Attributes()
-		for attributes.Next() {
-			attribute := attributes.Current()
-			log.Printf("Attribute %s=%s", attribute.Name.String(), attribute.Value.String())
-		}
-	}
-	if err := seriesIter.Err(); err != nil {
-		log.Fatalf("error in series iterator: %v", err)
-	}
-}
-
-func timer(name string) func() {
-	start := time.Now()
-	return func() {
-		fmt.Printf("%s took %v\n", name, time.Since(start))
-	}
-}
-
-func writeAndReadLargeDataWithoutAttributes(session client.Session, count int) {
-
-	// Create session with large number of data without attribute values
-
-	start := xtime.Now()
-	var (
-		seriesID = ident.StringID("__name__=\"cpu_user_util\",region=\"us-east-1\",service=\"myservice1\"")
-		tags     = []ident.Tag{
-			{Name: ident.StringID("region"), Value: ident.StringID("us-east-1")},
-			{Name: ident.StringID("service"), Value: ident.StringID("myservice1")},
-		}
-		tagsIter = ident.NewTagsIterator(ident.NewTags(tags...))
-	)
-
-	func() {
-		defer timer("write-large-series-without-attributes")()
-		log.Printf("------ write large data (no attributes) to db ------")
-		writtenValue := 1.0
-		// Same series, but with 1000000 attributes
-		tookTimes := make([]int, count)
-		for i := 0; i < count; i++ {
-			//seriesName := "__name__=\"cpu_user_util\",region=\"us-east-1\",service=\"myservice1\""
-			//hostName := seriesName + fmt.Sprintf("host-%07d", i%10)
-			//seriesID = ident.StringID(hostName)
-			clockStart := xtime.Now()
-			// Write a ts value with tags and attributes
-			timestamp := xtime.Now()
-			err := session.WriteTagged(
-				namespaceID,
-				seriesID,
-				tagsIter,
-				timestamp,
-				writtenValue,
-				xtime.Nanosecond,
-				nil)
-			if err != nil {
-				log.Fatalf("error writing series %s, err: %v", seriesID.String(), err)
-			}
-			writtenValue++
-			clockStop := xtime.Now()
-			dur := clockStop - clockStart
-			tookTimes[i] = dur.ToTime().Nanosecond() / 1000
-		}
-		d := stats.LoadRawData(tookTimes)
-		//a, _ := stats.Min(d)
-		//fmt.Println("min time:", a)
-		pcts := []float64{50, 90, 99, 99.9}
-		desc, _ := stats.Describe(d, false, &pcts)
-		fmt.Println(desc.String(2))
-	}()
-	end := xtime.Now()
-	return
-
-	func() {
-		defer timer("read-large-series-without-attributes")()
-		log.Printf("------ read large data (no attributes) to db ------")
-		expVal := 1.0
-		// Now lets read the series back out
-		seriesIter, err := session.Fetch(
-			namespaceID,
-			seriesID,
-			start.Add(-time.Millisecond*5), // Adjust by 5 milliseconds
-			end)
-		if err != nil {
-			log.Fatalf("error fetching data for untagged series: %v", err)
-		}
-		for seriesIter.Next() {
-			dp, _, _ := seriesIter.Current()
-			if dp.Value != expVal {
-				log.Fatalf("unexpected value: found %v but expected %v", dp.Value, expVal)
-			}
-			expVal++
-			//log.Printf("Series Value %s: %v", dp.TimestampNanos.String(), dp.Value)
-
-			// Lets also print out the tags and attributes
-			tags := seriesIter.Tags()
-			for tags.Next() {
-				tag := tags.Current()
-				log.Printf("Tag %s=%s", tag.Name.String(), tag.Value.String())
-			}
-		}
-
-		if err := seriesIter.Err(); err != nil {
-			log.Fatalf("error in series iterator: %v", err)
-		}
-	}()
-}
-
-func writeAndReadLargeData(session client.Session, count int) {
+func writeAndReadLargeTableData(session client.Session, count int) {
 
 	// Create session with large number of attribute values
+	var maxConcurrentWrites uint32 = 512
 
-	boostSession := boostclient.NewBoostSession(session, 1000)
+	boostSession := boostclient.NewBoostSession(
+		session,
+		1000,
+		maxConcurrentWrites)
+
+	// Create new M3DBTapTable
+	sf := boostclient.NewM3DBSeriesFamily(
+		"myAppSF",
+		namespaceID,
+		1,
+		boostSession,
+		64,
+		100000000,
+		maxConcurrentWrites)
 
 	var (
 		seriesID = ident.StringID("__name__=\"cpu_user_util\",region=\"us-east-1\",service=\"myservice1\"")
@@ -363,26 +142,22 @@ func writeAndReadLargeData(session client.Session, count int) {
 	)
 
 	// Write with fresh dictionary
-	numWrites = atomic.Uint64{}
-	numWrites.Store(0)
-	writeDataWithAttributes(boostSession, seriesID, tagsIter, count)
-	time.Sleep(250 * time.Millisecond)
+	writeSF(sf, seriesID, tagsIter, count)
 
 	// Write with reuse of the dictionary
 	log.Printf("Write with reuse of the dictionary")
-	numWrites.Store(0)
-	start, end := writeDataWithAttributes(boostSession, seriesID, tagsIter, count)
+	start, end := writeSF(sf, seriesID, tagsIter, count)
 	time.Sleep(5000 * time.Millisecond)
 
-	readDataWithAttribute(boostSession, seriesID, start, end)
+	// Now read back and check the values are in order.
+	readSF(sf, seriesID, start, end)
 }
 
-func writeDataWithAttributes(boostSession *boostclient.BoostSession,
+func writeSF(sf *boostclient.M3DBSeriesFamily,
 	seriesID ident.ID,
 	tagsIter ident.TagIterator,
 	count int) (xtime.UnixNano, xtime.UnixNano) {
-	defer timer("write-large-series-with-attributes")()
-	log.Printf("------ write large data (with attributes) to db ------")
+	defer timer("write-large-series-m3db-table")()
 	start := xtime.Now()
 	writtenValue := 1.0
 
@@ -396,34 +171,29 @@ func writeDataWithAttributes(boostSession *boostclient.BoostSession,
 
 		// Write a ts value with tags and attributes
 		timestamp := xtime.Now()
-		err := boostSession.WriteValueWithTaggedAttributes(
-			namespaceID,
+		err := sf.WriteTagged(
 			seriesID,
 			tagsIter,
 			attrIter,
 			timestamp,
 			writtenValue,
 			xtime.Nanosecond,
-			completionFn)
+			nil)
 		if err != nil {
 			log.Fatalf("error writing series %s, err: %v", seriesID.String(), err)
 		}
 		writtenValue++
 	}
-	end := xtime.Now()
-
-	// Wait until numWrites reaches count
-	for {
-		if numWrites.Load() == uint64(count) {
-			break
-		}
-		time.Sleep(1 * time.Millisecond)
+	errWait := sf.Wait(5 * time.Second)
+	if errWait != nil {
+		log.Fatalf("error waiting for pending writes to complete: %v", errWait)
 	}
+	end := xtime.Now()
 
 	return start, end
 }
 
-func readDataWithAttribute(boostSession *boostclient.BoostSession,
+func readSF(sf *boostclient.M3DBSeriesFamily,
 	seriesID ident.ID,
 	start xtime.UnixNano,
 	end xtime.UnixNano) {
@@ -431,8 +201,7 @@ func readDataWithAttribute(boostSession *boostclient.BoostSession,
 	log.Printf("------ read large data (with attributes) to db ------")
 	expVal := 1.0
 	// Now lets read the series back out
-	seriesIter, err := boostSession.FetchValueWithTaggedAttribute(
-		namespaceID,
+	seriesIter, err := sf.Fetch(
 		seriesID,
 		start.Add(-time.Millisecond*5), // Adjust by 5 milliseconds
 		end)
@@ -470,4 +239,11 @@ func readDataWithAttribute(boostSession *boostclient.BoostSession,
 		log.Fatalf("error in series iterator: %v", err)
 	}
 
+}
+
+func timer(name string) func() {
+	start := time.Now()
+	return func() {
+		fmt.Printf("%s took %v\n", name, time.Since(start))
+	}
 }

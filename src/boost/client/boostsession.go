@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/m3db/m3/src/boost/core"
@@ -22,20 +24,25 @@ type BoostSession struct {
 	symTables           *lru.Cache[string, *core.SymTable]
 	numSymbolUpdates    uint64
 	numAttributeUpdates uint64
+	maxConcurrentWrites uint32
+	pendingWrites       atomic.Int32
 	rwControl           sync.Mutex
 }
 
 // NewBoostSession returns a new session that can be used to write to the database.
 func NewBoostSession(
 	session client.Session,
-	maxSymTables int) *BoostSession {
+	maxSymTables int,
+	maxConcurrentWrites uint32) *BoostSession {
 	bs := &BoostSession{
 		session:             session,
 		maxSymTables:        maxSymTables,
 		numSymbolUpdates:    0,
 		numAttributeUpdates: 0,
+		maxConcurrentWrites: maxConcurrentWrites,
 		rwControl:           sync.Mutex{},
 	}
+	bs.pendingWrites.Store(0)
 
 	cache, err := lru.New[string, *core.SymTable](maxSymTables)
 	if err != nil {
@@ -89,15 +96,15 @@ func (bs *BoostSession) WriteValueWithTaggedAttributes(
 	t xtime.UnixNano,
 	value float64,
 	unit xtime.Unit,
-	completionFn core.TAPWriteCompletionFn,
+	symTableNameResolver core.SymbolTableStreamNameResolver,
+	completionFn core.WriteCompletionFn,
 ) error {
 
 	// Check if the symbol table exists for this data series. This is done
 	// under a lock
 	bs.rwControl.Lock()
 
-	dataSeriesId := id.String()
-	symTableName := "m3_symboltable_" + dataSeriesId
+	symTableName := symTableNameResolver(id)
 	symTable, ok := bs.symTables.Get(symTableName)
 	if !ok {
 		m3dbStreamWriter := core.NewM3DBSymStreamWriter(
@@ -132,8 +139,12 @@ func (bs *BoostSession) WriteValueWithTaggedAttributes(
 	for i, index := range indexedHeader {
 		binary.LittleEndian.PutUint32(tmp[i*4:], uint32(index))
 	}
+
 	// Unlock the mutex
 	bs.rwControl.Unlock()
+
+	// Don't schedule if there are too many pending writes
+	bs.waitIfTooManyPendingWrites()
 
 	go func(
 		namespace,
@@ -142,8 +153,16 @@ func (bs *BoostSession) WriteValueWithTaggedAttributes(
 		t xtime.UnixNano,
 		value float64,
 		unit xtime.Unit,
-		completionFn core.TAPWriteCompletionFn) {
-		ret := bs.session.WriteTagged(namespace, id, tags, t, value, unit, annotation)
+		completionFn core.WriteCompletionFn) {
+		var ret error = nil
+		if tags != nil {
+			ret = bs.session.WriteTagged(namespace, id, tags, t, value, unit, annotation)
+		} else {
+			ret = bs.session.Write(namespace, id, t, value, unit, annotation)
+		}
+		bs.writeCompletionFn(ret)
+
+		// Call the user provided completion function
 		completionFn(ret)
 	}(namespace, id, tags.Duplicate(), t, value, unit, completionFn)
 
@@ -156,6 +175,7 @@ func (bs *BoostSession) FetchValueWithTaggedAttribute(
 	id ident.ID,
 	startInclusive xtime.UnixNano,
 	endExclusive xtime.UnixNano,
+	symTableNameResolver core.SymbolTableStreamNameResolver,
 ) (*BoostSeriesIterator, error) {
 	seriesIt, err := bs.session.Fetch(namespace, id, startInclusive, endExclusive)
 	if err != nil {
@@ -164,6 +184,7 @@ func (bs *BoostSession) FetchValueWithTaggedAttribute(
 
 	return NewBoostSeriesIterator(
 		seriesIt,
+		symTableNameResolver,
 		bs.fetchOrCreateSymTable,
 		startInclusive,
 		endExclusive), nil
@@ -268,6 +289,26 @@ func (bs *BoostSession) Close() error {
 	return bs.session.Close()
 }
 
+// Wait waits for all pending writes to complete or the timeout to occur.
+// If timeout is 0, wait indefinitely until all pending writes are completed.
+// Returns an error if timeout occurs.
+func (bs *BoostSession) Wait(timeout time.Duration) error {
+	totalUs := 0
+
+	for {
+		if bs.pendingWrites.Load() == 0 {
+			break
+		}
+		time.Sleep(100 * time.Microsecond)
+		totalUs += 100
+		if (timeout > 0) && (totalUs > int(timeout/time.Microsecond)) {
+			return errors.New("timeout waiting for pending writes to complete")
+		}
+	}
+
+	return nil
+}
+
 // Update symbol table with missing attribute values and also add the attribute
 // values to the attribute in the symbol table
 func (bs *BoostSession) updateSymbolsAndAttributes(symTable *core.SymTable, attributes map[string]string) error {
@@ -278,7 +319,7 @@ func (bs *BoostSession) updateSymbolsAndAttributes(symTable *core.SymTable, attr
 		}
 	}
 
-	err := symTable.UpdateDictionary(symbols)
+	err := symTable.UpdateDictionary(symbols, nil)
 	if err != nil {
 		return err
 	}
@@ -286,7 +327,7 @@ func (bs *BoostSession) updateSymbolsAndAttributes(symTable *core.SymTable, attr
 
 	// Update the attributes
 	for attrName, attrValue := range attributes {
-		err = symTable.InsertAttributeValue(attrName, attrValue)
+		err = symTable.InsertAttributeValue(attrName, attrValue, nil)
 		if err != nil {
 			return err
 		}
@@ -328,7 +369,7 @@ func (bs *BoostSession) readSymTableStream(
 		return nil, err
 	}
 	symTable := core.NewSymTable(streamId.String(), version, nil)
-	symTable.UpdateDictionary(instrParams)
+	symTable.UpdateDictionary(instrParams, nil)
 
 	// Loop through the stream until we find the EndSymTable instruction
 	// or we reach the end of the stream (NOPInstruction). Verify that the
@@ -360,7 +401,7 @@ func (bs *BoostSession) readSymTableStream(
 				return nil, err
 			}
 			symTable := core.NewSymTable(streamId.String(), version, nil)
-			symTable.UpdateDictionary(instrParams)
+			symTable.UpdateDictionary(instrParams, nil)
 		}
 
 		if seqNum != prevSeqNum+1 {
@@ -381,13 +422,13 @@ func (bs *BoostSession) readSymTableStream(
 			if err != nil {
 				return nil, err
 			}
-			symTable.UpdateDictionary(instrParams)
+			symTable.UpdateDictionary(instrParams, nil)
 		case core.AddAttribute:
 			attrName, _, indexValues, err := symTableReader.ReadAttributeInstruction()
 			if err != nil {
 				return nil, err
 			}
-			symTable.InsertAttributeIndices(attrName, indexValues)
+			symTable.InsertAttributeIndices(attrName, indexValues, nil)
 		}
 	}
 
@@ -428,4 +469,21 @@ func (bs *BoostSession) findInitInstruction(
 	}
 
 	return v, seqNum, nil
+}
+
+// Wait if there are too many pending writes
+func (bs *BoostSession) waitIfTooManyPendingWrites() {
+	for {
+		oldVal := bs.pendingWrites.Load()
+		if oldVal < int32(bs.maxConcurrentWrites) {
+			if bs.pendingWrites.CompareAndSwap(oldVal, oldVal+1) {
+				break
+			}
+		}
+	}
+}
+
+// Write completion function
+func (bs *BoostSession) writeCompletionFn(err error) {
+	bs.pendingWrites.Add(-1)
 }

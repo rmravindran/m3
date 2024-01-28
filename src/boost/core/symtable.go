@@ -2,6 +2,7 @@ package core
 
 import (
 	"errors"
+	"time"
 )
 
 type AttributeEncoding int
@@ -86,7 +87,9 @@ func (sym *SymTable) NumAttributes() int {
 
 // Update the dictionary with the given attribute values. If the attribute
 // values already exists in the dictionary, this is an error
-func (sym *SymTable) UpdateDictionary(attributeValues []string) error {
+func (sym *SymTable) UpdateDictionary(
+	attributeValues []string,
+	writeCompleteFn WriteCompletionFn) error {
 	if len(attributeValues) == 0 {
 		return errors.New("attribute values are empty")
 	}
@@ -115,12 +118,16 @@ func (sym *SymTable) UpdateDictionary(attributeValues []string) error {
 	if !sym.finalized && sym.streamWriter != nil {
 		var err error = nil
 		if sym.instructionSeqNum == 0 {
-			err = sym.streamWriter.WriteInitInstruction(sym.version, attributeValues)
+			err = sym.streamWriter.WriteInitInstruction(
+				sym.version,
+				attributeValues,
+				writeCompleteFn)
 		} else {
 			err = sym.streamWriter.WriteUpdateInstruction(
 				sym.version,
 				sym.instructionSeqNum+1,
-				attributeValues)
+				attributeValues,
+				writeCompleteFn)
 		}
 		if err != nil {
 			return err
@@ -142,7 +149,10 @@ func (sym *SymTable) AttributeValueExists(value string) bool {
 // Inserts the given attribute value into the attribute having the specified
 // name. If the attribute name doesn't exist, a new attribute is created in the
 // SymTable. If the value already exists, this is a NOP
-func (sym *SymTable) InsertAttributeValue(name string, value string) error {
+func (sym *SymTable) InsertAttributeValue(
+	name string,
+	value string,
+	writeCompleteFn WriteCompletionFn) error {
 
 	if _, ok := sym.dictToIndex[value]; !ok {
 		id := uint64(len(sym.dictToIndex))
@@ -168,37 +178,19 @@ func (sym *SymTable) InsertAttributeValue(name string, value string) error {
 	}
 
 	// Update the stream
-	return sym.updateStreamWithAttributeInstructionParam(name, []uint64{id})
-}
-
-// Update the stream if the table is not finalized and we have a stream
-// writer attached to this symtable
-func (sym *SymTable) updateStreamWithAttributeInstructionParam(
-	name string,
-	indices []uint64) error {
-
-	if sym.streamWriter != nil && !sym.finalized {
-		err := sym.streamWriter.WriteAttributeInstruction(
-			sym.version,
-			sym.instructionSeqNum+1,
-			name,
-			DictionaryEncodedValue,
-			indices)
-		if err != nil {
-			return err
-		}
-
-		// Update the sequence number
-		sym.instructionSeqNum++
-	}
-
-	return nil
+	return sym.updateStreamWithAttributeInstructionParam(
+		name,
+		[]uint64{id},
+		writeCompleteFn)
 }
 
 // Insert the attribute values denoted by the given attribute indices into the
 // attribute having the specified name. If the attribute indices are not valid
 // (i.e. they don't exist in the symbol table), this is an error.
-func (sym *SymTable) InsertAttributeIndices(name string, indices []uint64) error {
+func (sym *SymTable) InsertAttributeIndices(
+	name string,
+	indices []uint64,
+	writeCompleteFn WriteCompletionFn) error {
 	if _, ok := sym.attributeTable[name]; !ok {
 		sym.attributeTable[name] = &AttributeTable{
 			name:                   name,
@@ -223,7 +215,10 @@ func (sym *SymTable) InsertAttributeIndices(name string, indices []uint64) error
 		sym.attributeTable[name].encodedValuesFromIndex[index] = uint64(len(sym.attributeTable[name].encodedValuesFromIndex))
 	}
 
-	return sym.updateStreamWithAttributeInstructionParam(name, indices)
+	return sym.updateStreamWithAttributeInstructionParam(
+		name,
+		indices,
+		writeCompleteFn)
 }
 
 // Find the index of the given attribute value. If the attribute having the
@@ -351,4 +346,39 @@ func (sym *SymTable) IsSame(other *SymTable) bool {
 	}
 
 	return true
+}
+
+// Wait for all pending write operations to complete or until the specified
+// timeout is reached. If timeout is 0, wait indefinitely wait for all
+// pending writes to complete.
+func (sym *SymTable) Wait(timeout time.Duration) {
+	if sym.streamWriter != nil {
+		sym.streamWriter.Wait(timeout)
+	}
+}
+
+// Update the stream if the table is not finalized and we have a stream
+// writer attached to this symtable
+func (sym *SymTable) updateStreamWithAttributeInstructionParam(
+	name string,
+	indices []uint64,
+	writeCompleteFn WriteCompletionFn) error {
+
+	if sym.streamWriter != nil && !sym.finalized {
+		err := sym.streamWriter.WriteAttributeInstruction(
+			sym.version,
+			sym.instructionSeqNum+1,
+			name,
+			DictionaryEncodedValue,
+			indices,
+			writeCompleteFn)
+		if err != nil {
+			return err
+		}
+
+		// Update the sequence number
+		sym.instructionSeqNum++
+	}
+
+	return nil
 }

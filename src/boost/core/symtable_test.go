@@ -13,7 +13,7 @@ func TestSymTableUpdateDictionary(t *testing.T) {
 
 	attributeValues := []string{"a", "b", "c", "d", "e"}
 
-	err := symTable.UpdateDictionary(attributeValues)
+	err := symTable.UpdateDictionary(attributeValues, nil)
 	require.NoError(t, err)
 
 	// Test that the dictionary is updated correctly
@@ -27,7 +27,7 @@ func TestSymTableUpdateDictionary(t *testing.T) {
 	require.False(t, symTable.AttributeValueExists("f"))
 
 	// Adding something that already exists should fail
-	err = symTable.UpdateDictionary([]string{"a"})
+	err = symTable.UpdateDictionary([]string{"a"}, nil)
 	require.Error(t, err)
 }
 
@@ -36,17 +36,17 @@ func TestSymTableAttributes(t *testing.T) {
 	require.NotNil(t, symTable)
 
 	attributeValues := []string{"a", "b", "c", "d", "e"}
-	err := symTable.UpdateDictionary(attributeValues)
+	err := symTable.UpdateDictionary(attributeValues, nil)
 	require.NoError(t, err)
 
 	// Create an attribute
-	symTable.InsertAttributeValue("host", "a")
+	symTable.InsertAttributeValue("host", "a", nil)
 	require.Equal(t, 0, symTable.FindAttributeIndex("host", "a"))
 	// value "b" hasn't yet mapped to the host attribute
 	require.Equal(t, -1, symTable.FindAttributeIndex("host", "b"))
 	// now map it. Observe that the index should be continuous from the previous
 	// index
-	symTable.InsertAttributeValue("host", "b")
+	symTable.InsertAttributeValue("host", "b", nil)
 	require.Equal(t, 1, symTable.FindAttributeIndex("host", "b"))
 	// and verify that previous index hasn't changed.
 	require.Equal(t, 0, symTable.FindAttributeIndex("host", "a"))
@@ -85,25 +85,25 @@ func TestSymTableMultipleAttributesSharingIndex(t *testing.T) {
 
 	attributeValues := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
 
-	err := symTable.UpdateDictionary(attributeValues)
+	err := symTable.UpdateDictionary(attributeValues, nil)
 	require.NoError(t, err)
 
 	// Add all attribute values as host attribute values
 	for ndx, v := range attributeValues {
-		symTable.InsertAttributeValue("host", v)
+		symTable.InsertAttributeValue("host", v, nil)
 		require.Equal(t, ndx, symTable.FindAttributeIndex("host", v))
 	}
 
 	// Add some of the attribute values as src attribute values
 	// Note that each attribute has its own index space starting at 0.
 	for ndx, v := range attributeValues[0:5] {
-		symTable.InsertAttributeValue("src", v)
+		symTable.InsertAttributeValue("src", v, nil)
 		require.Equal(t, ndx, symTable.FindAttributeIndex("src", v))
 	}
 
 	// Add remaining attribute values as dst attribute values
 	for ndx, v := range attributeValues[5:] {
-		symTable.InsertAttributeValue("dst", v)
+		symTable.InsertAttributeValue("dst", v, nil)
 		require.Equal(t, ndx, symTable.FindAttributeIndex("dst", v))
 	}
 
@@ -146,29 +146,29 @@ func TestSymTableSame(t *testing.T) {
 
 	attributeValues := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"}
 
-	err := symTable.UpdateDictionary(attributeValues)
+	err := symTable.UpdateDictionary(attributeValues, nil)
 	require.NoError(t, err)
-	err = otherTable.UpdateDictionary(attributeValues)
+	err = otherTable.UpdateDictionary(attributeValues, nil)
 	require.NoError(t, err)
 
 	// Add all attribute values as host attribute values
 	for _, v := range attributeValues {
-		symTable.InsertAttributeValue("host", v)
-		otherTable.InsertAttributeValue("host", v)
+		symTable.InsertAttributeValue("host", v, nil)
+		otherTable.InsertAttributeValue("host", v, nil)
 	}
 	require.True(t, symTable.IsSame(otherTable))
 
 	// Missing dictionary entry is not the same
-	symTable.InsertAttributeValue("host", "crap")
+	symTable.InsertAttributeValue("host", "crap", nil)
 	require.False(t, symTable.IsSame(otherTable))
 
 	// Now it should be same
-	otherTable.InsertAttributeValue("host", "crap")
+	otherTable.InsertAttributeValue("host", "crap", nil)
 	require.True(t, symTable.IsSame(otherTable))
 
 	// Add some of the attribute values as src attribute values
 	for _, v := range attributeValues[0:5] {
-		symTable.InsertAttributeValue("src", v)
+		symTable.InsertAttributeValue("src", v, nil)
 	}
 
 	// Attribute doesn't exist int the other table
@@ -176,20 +176,20 @@ func TestSymTableSame(t *testing.T) {
 
 	// Attribute exists but doesn't all the values
 	for _, v := range attributeValues[0:4] {
-		otherTable.InsertAttributeValue("src", v)
+		otherTable.InsertAttributeValue("src", v, nil)
 	}
 	require.False(t, symTable.IsSame(otherTable))
 
 	// Now all values exists
-	otherTable.InsertAttributeValue("src", attributeValues[4])
+	otherTable.InsertAttributeValue("src", attributeValues[4], nil)
 	require.True(t, symTable.IsSame(otherTable))
 
 	// Attribute exist but not applied in the same order. This implies
 	// that the two streams that built up the the symtable was not streamed
 	// in the same order
-	symTable.InsertAttributeValue("dst", attributeValues[0])
-	symTable.InsertAttributeValue("dst", attributeValues[1])
-	otherTable.InsertAttributeValue("dst", attributeValues[1])
-	otherTable.InsertAttributeValue("dst", attributeValues[0])
+	symTable.InsertAttributeValue("dst", attributeValues[0], nil)
+	symTable.InsertAttributeValue("dst", attributeValues[1], nil)
+	otherTable.InsertAttributeValue("dst", attributeValues[1], nil)
+	otherTable.InsertAttributeValue("dst", attributeValues[0], nil)
 	require.False(t, symTable.IsSame(otherTable))
 }

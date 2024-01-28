@@ -18,29 +18,32 @@ type SymTableFetchFunction func(
 	timeEnd xtime.UnixNano) (*core.SymTable, error)
 
 type BoostSeriesIterator struct {
-	seriesIter      encoding.SeriesIterator
-	symTableFetchFn SymTableFetchFunction
-	symTable        *core.SymTable
-	startTime       xtime.UnixNano
-	endTime         xtime.UnixNano
-	annotation      ts.Annotation
-	attributeIter   ident.TagIterator
+	seriesIter           encoding.SeriesIterator
+	symTableNameResolver core.SymbolTableStreamNameResolver
+	symTableFetchFn      SymTableFetchFunction
+	symTable             *core.SymTable
+	startTime            xtime.UnixNano
+	endTime              xtime.UnixNano
+	annotation           ts.Annotation
+	attributeIter        ident.TagIterator
 }
 
 // NewBoostSeriesIterator returns a new series iterator
 func NewBoostSeriesIterator(
 	seriesIter encoding.SeriesIterator,
+	symTableNameResolver core.SymbolTableStreamNameResolver,
 	symTableFetchFn SymTableFetchFunction,
 	startTime xtime.UnixNano,
 	endTime xtime.UnixNano) *BoostSeriesIterator {
 	return &BoostSeriesIterator{
-		seriesIter:      seriesIter,
-		symTableFetchFn: symTableFetchFn,
-		symTable:        nil,
-		startTime:       startTime,
-		endTime:         endTime,
-		annotation:      nil,
-		attributeIter:   nil,
+		seriesIter:           seriesIter,
+		symTableNameResolver: symTableNameResolver,
+		symTableFetchFn:      symTableFetchFn,
+		symTable:             nil,
+		startTime:            startTime,
+		endTime:              endTime,
+		annotation:           nil,
+		attributeIter:        nil,
 	}
 }
 
@@ -96,7 +99,9 @@ func (bsi *BoostSeriesIterator) Attributes() ident.TagIterator {
 	// First 2 bytes the version of the symtable
 	version := binary.LittleEndian.Uint16(bsi.annotation)
 	if (bsi.symTable == nil) || (bsi.symTable.Version() != version) {
-		symTableName := "m3_symboltable_" + bsi.ID().String()
+		symTableName := bsi.symTableNameResolver(bsi.ID())
+		//symTableName := core.GetSymbolTableName(bsi.ID().String())
+		//symTableName := "m3_symboltable_" + bsi.ID().String()
 		symTable, err := bsi.symTableFetchFn(
 			bsi.Namespace(),
 			symTableName,
