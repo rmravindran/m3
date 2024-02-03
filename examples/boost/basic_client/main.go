@@ -109,7 +109,7 @@ func main() {
 	defer pprof.StopCPUProfile()
 
 	// Write and read large table data
-	writeAndReadLargeTableData(session, 100000)
+	writeAndReadLargeTableData(session, 1000000)
 }
 
 func writeAndReadLargeTableData(session client.Session, count int) {
@@ -125,6 +125,7 @@ func writeAndReadLargeTableData(session client.Session, count int) {
 	// Create new M3DBTapTable
 	sf := boostclient.NewM3DBSeriesFamily(
 		"myAppSF",
+		"myAppDomain",
 		namespaceID,
 		1,
 		boostSession,
@@ -133,7 +134,7 @@ func writeAndReadLargeTableData(session client.Session, count int) {
 		maxConcurrentWrites)
 
 	var (
-		seriesID = ident.StringID("__name__=\"cpu_user_util\",region=\"us-east-1\",service=\"myservice1\"")
+		seriesID = ident.StringID("cpu_user_util_myservice1")
 		tags     = []ident.Tag{
 			{Name: ident.StringID("region"), Value: ident.StringID("us-east-1")},
 			{Name: ident.StringID("service"), Value: ident.StringID("myservice1")},

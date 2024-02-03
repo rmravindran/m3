@@ -2,7 +2,6 @@ package client
 
 import (
 	"errors"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,8 +13,11 @@ import (
 
 // Implements the SeriesFamily interface
 type M3DBSeriesFamily struct {
-	// Name of the table
+	// Name of the family
 	name string
+
+	// Domain name of the family
+	domainName string
 
 	// Namespace of the table
 	namespace ident.ID
@@ -48,14 +50,29 @@ type M3DBSeriesFamily struct {
 // NewM3DBSeriesFamily creates a new M3DBTAPTable
 func NewM3DBSeriesFamily(
 	name string,
+	domainName string,
 	namespace ident.ID,
 	version uint16,
 	session *BoostSession,
 	distributionFactor uint16,
 	dictionaryLimit uint32,
 	maxConcurrentWrites uint32) *M3DBSeriesFamily {
+
+	if domainName == "" {
+		domainName = "dd"
+	}
+
+	if name == "" {
+		name = "naf"
+	}
+
+	if distributionFactor == 0 {
+		distributionFactor = 1
+	}
+
 	ret := &M3DBSeriesFamily{
 		name:                  name,
+		domainName:            domainName,
 		namespace:             namespace,
 		version:               version,
 		session:               session,
@@ -137,10 +154,13 @@ func (sf *M3DBSeriesFamily) WriteTagged(
 	// Find the id from the distribution factor
 	nextDistributionIndex := sf.nextDistributionIndex.Add(1)
 	nextDistributionIndex %= uint32(sf.distributionFactor)
-	prefix := fmt.Sprintf("m3_data_%05d_", nextDistributionIndex)
 
 	// Qualified Series Name
-	seriesName := prefix + id.String()
+	seriesName := core.GetQualifiedSeriesName(
+		sf.domainName,
+		sf.name,
+		uint16(nextDistributionIndex),
+		id)
 	qualifiedId := ident.StringID(seriesName)
 
 	return sf.session.WriteValueWithTaggedAttributes(
@@ -182,8 +202,7 @@ func (sf *M3DBSeriesFamily) Fetch(
 
 func (sf *M3DBSeriesFamily) symbolTableStreamNameResolver(
 	qualifiedSeriesId ident.ID) string {
-	return "m3_symboltable_sf_" + sf.name
-	//+ core.GetSeriesName(qualifiedSeriesId.String())
+	return sf.domainName + "::" + sf.name + "::symboltable"
 }
 
 // Wait if there are too many pending writes
